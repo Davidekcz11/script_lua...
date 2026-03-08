@@ -29,6 +29,7 @@ local Window = Rayfield:CreateWindow({
 local FlyTab = Window:CreateTab("Fly", 4483362458)
 local HighlightTab = Window:CreateTab("Highlight", 0)
 local AntiTab = Window:CreateTab("Anti", 0)
+local TeleportTab = Window:CreateTab("Teleport", 0)
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -64,6 +65,9 @@ local espColor = Color3.fromRGB(255, 255, 255)
 -- ANTI FEATURES VARIABLES
 local antiSitEnabled = false
 local antiFlingEnabled = false
+
+-- TELEPORT VARIABLES
+local selectedTeleportPlayer = nil
 
 -- FLY FUNCTIONALITY
 local function startFly()
@@ -370,6 +374,37 @@ end
 local function disableAntiFling()
    antiFlingEnabled = false
    stopAntiFlingProtection()
+end
+
+-- TELEPORT FUNCTIONALITY
+local function performTeleport(targetPlayer)
+   if not targetPlayer or not targetPlayer.Character then
+      Rayfield:Notify({
+         Title = "Error",
+         Content = "Player not found!",
+         Duration = 2,
+         Image = 4483362458,
+      })
+      return
+   end
+   
+   local targetHRP = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+   if not targetHRP then return end
+   
+   character = player.Character
+   humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+   
+   if not humanoidRootPart then return end
+   
+   -- Teleport directly to target
+   humanoidRootPart.CFrame = targetHRP.CFrame + Vector3.new(0, 3, 0)
+   
+   Rayfield:Notify({
+      Title = "Teleported!",
+      Content = "Teleported to " .. targetPlayer.Name,
+      Duration = 2,
+      Image = 4483362458,
+   })
 end
 
 -- ======== FLY TAB GUI ========
@@ -881,6 +916,81 @@ HighlightTab:CreateColorPicker({
          Image = 4483362458,
       })
    end
+})
+
+-- ======== TELEPORT TAB GUI ========
+TeleportTab:CreateSection("Teleport")
+
+TeleportTab:CreateButton({
+   Name = "Teleport",
+   Callback = function()
+      if selectedTeleportPlayer then
+         performTeleport(selectedTeleportPlayer)
+      else
+         Rayfield:Notify({
+            Title = "No Player Selected",
+            Content = "Please select a player first!",
+            Duration = 2,
+            Image = 4483362458,
+         })
+      end
+   end
+})
+
+local teleportDropdown = TeleportTab:CreateDropdown({
+   Name = "Select Player",
+   Options = {},
+   CurrentOption = {"Select Player"},
+   MultipleOptions = false,
+   Flag = "TeleportPlayerDropdown",
+   Callback = function(Options)
+      local selectedName = Options[1]
+      selectedTeleportPlayer = nil
+      
+      for _, plyr in pairs(Players:GetPlayers()) do
+         if plyr.Name == selectedName then
+            selectedTeleportPlayer = plyr
+            Rayfield:Notify({
+               Title = "Player Selected",
+               Content = selectedName .. " selected!",
+               Duration = 1,
+               Image = 4483362458,
+            })
+            break
+         end
+      end
+   end
+})
+
+local function updateTeleportPlayerList()
+   local playerNames = {}
+   for _, plyr in pairs(Players:GetPlayers()) do
+      if plyr ~= player then
+         table.insert(playerNames, plyr.Name)
+      end
+   end
+   
+   if #playerNames > 0 then
+      teleportDropdown:Refresh(playerNames, true)
+   end
+end
+
+Players.PlayerAdded:Connect(function()
+   task.wait(0.5)
+   updateTeleportPlayerList()
+end)
+
+Players.PlayerRemoving:Connect(function()
+   task.wait(0.5)
+   updateTeleportPlayerList()
+   selectedTeleportPlayer = nil
+end)
+
+updateTeleportPlayerList()
+
+TeleportTab:CreateParagraph({
+   Title = "Teleport Info",
+   Content = "Select a player from the dropdown, then click Teleport to instantly teleport to them!"
 })
 
 -- ======== ANTI TAB GUI ========
