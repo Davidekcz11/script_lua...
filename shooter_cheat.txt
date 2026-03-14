@@ -1,0 +1,1013 @@
+--[[
+    Silent Aim - Counter Blox / Town / Rivals / Arsenal
+    Camera-only method — no remote hooks, no RAC detection
+    LocalScript inside StarterCharacterScripts
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = workspace.CurrentCamera
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+local Character   = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+
+local Config = {
+    Enabled      = true,
+    FOVRadius    = 120,
+    ShowFOV      = true,
+    FOVThickness = 1.5,
+    MaxDistance  = 1000,
+    TeamCheck    = true,
+    ToggleKey    = Enum.KeyCode.T,
+    SnapFrames   = 2,
+}
+
+local DefaultColor = Color3.fromRGB(255, 255, 255)
+local ReadyColor   = Color3.fromRGB(255, 165, 0)
+local BoxColor     = Color3.fromRGB(255, 165, 0)
+
+local LockedTarget    = nil
+local LockedPart      = nil
+local ESPObjects      = {}
+local IsShooting      = false
+local IsHolding       = false
+local SnapFrameCount  = 0
+local Terminated      = false
+local LockedCamCFrame = nil
+local LastGoodPos     = nil
+
+local Connections = {}
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function ClearLock()
+    LockedTarget    = nil
+    LockedPart      = nil
+    LockedCamCFrame = nil
+    IsShooting      = false
+    IsHolding       = false
+    LastGoodPos     = nil
+    SnapFrameCount  = 0
+    pcall(function()
+        Camera.CameraType = Enum.CameraType.Custom
+    end)
+end
+
+-- ============================================================
+-- TEAM CHECK
+-- ============================================================
+local function IsSameTeam(player)
+    if not Config.TeamCheck then return false end
+    if player == LocalPlayer then return true end
+
+    if LocalPlayer.Team and player.Team then
+        if player.Team == LocalPlayer.Team then return true end
+    end
+
+    local myTeamID    = LocalPlayer:GetAttribute("TeamID")
+    local theirTeamID = player:GetAttribute("TeamID")
+    if myTeamID ~= nil and theirTeamID ~= nil then
+        local myStr    = tostring(myTeamID)
+        local theirStr = tostring(theirTeamID)
+        if myStr == theirStr and myStr ~= "" and myStr ~= "0" and myStr ~= "nil" then
+            return true
+        end
+    end
+
+    if (myTeamID == nil or tostring(myTeamID) == "") then
+        local myChar       = LocalPlayer.Character
+        local theirChar    = player.Character
+        local myCharEnv    = myChar and myChar:GetAttribute("EnvironmentID")
+        local theirCharEnv = theirChar and theirChar:GetAttribute("EnvironmentID")
+        if myCharEnv and theirCharEnv
+        and tostring(myCharEnv) == tostring(theirCharEnv)
+        and tostring(myCharEnv) ~= "" then
+            return true
+        end
+    end
+
+    local valueNames = {"Team", "Side", "Alliance", "TeamName", "Group"}
+    for _, valueName in ipairs(valueNames) do
+        local myVal    = LocalPlayer:FindFirstChild(valueName)
+        local theirVal = player:FindFirstChild(valueName)
+        if myVal and theirVal then
+            local myStr    = tostring(myVal.Value)
+            local theirStr = tostring(theirVal.Value)
+            if myStr == theirStr and myStr ~= ""
+            and myStr ~= "0" and myStr ~= "nil"
+            and myStr ~= "None" and myStr ~= "Neutral" then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+-- ============================================================
+-- ANTI EFFECTS
+-- ============================================================
+local AntiSmoke          = true
+local AntiFlash          = true
+local AntiFire           = true
+local AntiEffectsEnabled = true
+local AntiRecoil         = true
+local AntiSpread         = true
+
+local function CleanPart(obj)
+    if not AntiEffectsEnabled then return end
+    pcall(function()
+        if obj:IsA("ParticleEmitter") or obj:IsA("Smoke") or
+           obj:IsA("Fire") or obj:IsA("Sparkles") then
+            obj.Enabled = false
+            pcall(function() obj.Rate = 0 end)
+        end
+        if obj:IsA("BasePart") or obj:IsA("MeshPart") then
+            local name       = obj.Name:lower()
+            local isSmokeObj = name:find("smoke") or name:find("smok")
+                            or name:find("nade") or name:find("grenade")
+            local isFireObj  = name:find("fire") or name:find("molotov")
+                            or name:find("incend") or name:find("flame")
+            if AntiSmoke and isSmokeObj then
+                obj.Transparency = 1
+                obj.CastShadow   = false
+                for _, child in ipairs(obj:GetDescendants()) do
+                    if child:IsA("ParticleEmitter") or child:IsA("Smoke") then
+                        child.Enabled = false
+                        pcall(function() child.Rate = 0 end)
+                    end
+                end
+            end
+            if AntiFire and isFireObj then
+                obj.Transparency = 1
+                obj.CastShadow   = false
+                for _, child in ipairs(obj:GetDescendants()) do
+                    if child:IsA("Fire") or child:IsA("ParticleEmitter") then
+                        child.Enabled = false
+                        pcall(function() child.Rate = 0 end)
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function CleanFlash(obj)
+    if not AntiEffectsEnabled or not AntiFlash then return end
+    pcall(function()
+        if obj:IsA("Frame") or obj:IsA("ImageLabel") then
+            local name    = obj.Name:lower()
+            local isFlash = name:find("flash") or name:find("blind")
+                         or name:find("white") or name:find("effect")
+                         or name:find("overlay")
+            if isFlash then
+                obj.BackgroundTransparency = 1
+                if obj:IsA("ImageLabel") then obj.ImageTransparency = 1 end
+            end
+        end
+        if obj:IsA("Frame") then
+            local c = obj.BackgroundColor3
+            if c.R > 0.85 and c.G > 0.85 and c.B > 0.85
+            and obj.BackgroundTransparency < 0.3 then
+                obj.BackgroundTransparency = 1
+            end
+        end
+    end)
+end
+
+local function ScanWorkspace()
+    for _, obj in ipairs(workspace:GetDescendants()) do CleanPart(obj) end
+end
+
+local function ScanGui()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return end
+    for _, obj in ipairs(gui:GetDescendants()) do CleanFlash(obj) end
+end
+
+local function HookExistingGui()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return end
+    for _, obj in ipairs(gui:GetDescendants()) do
+        if obj:IsA("Frame") or obj:IsA("ImageLabel") then
+            local c = obj:GetPropertyChangedSignal("BackgroundTransparency"):Connect(function()
+                if not AntiFlash or not AntiEffectsEnabled then return end
+                CleanFlash(obj)
+            end)
+            table.insert(Connections, c)
+        end
+    end
+end
+
+local c1 = workspace.DescendantAdded:Connect(function(obj)
+    if not AntiEffectsEnabled then return end
+    task.wait()
+    CleanPart(obj)
+end)
+table.insert(Connections, c1)
+
+local c2 = LocalPlayer:WaitForChild("PlayerGui").DescendantAdded:Connect(function(obj)
+    if not AntiEffectsEnabled or not AntiFlash then return end
+    task.wait()
+    CleanFlash(obj)
+    if obj:IsA("Frame") or obj:IsA("ImageLabel") then
+        local c = obj:GetPropertyChangedSignal("BackgroundTransparency"):Connect(function()
+            if not AntiFlash or not AntiEffectsEnabled then return end
+            CleanFlash(obj)
+        end)
+        table.insert(Connections, c)
+        if obj:IsA("ImageLabel") then
+            local c3 = obj:GetPropertyChangedSignal("ImageTransparency"):Connect(function()
+                if not AntiFlash or not AntiEffectsEnabled then return end
+                CleanFlash(obj)
+            end)
+            table.insert(Connections, c3)
+        end
+    end
+end)
+table.insert(Connections, c2)
+
+ScanWorkspace()
+ScanGui()
+HookExistingGui()
+
+-- ============================================================
+-- ANTI SPREAD
+-- ============================================================
+local function ApplyAntiSpread()
+    if not AntiSpread then return end
+    pcall(function()
+        local char = LocalPlayer.Character
+        if not char then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        local vel = hrp.AssemblyLinearVelocity
+        hrp.AssemblyLinearVelocity = Vector3.new(0, vel.Y, 0)
+    end)
+end
+
+-- ============================================================
+-- FOV Circle
+-- ============================================================
+local Gui = Instance.new("ScreenGui")
+Gui.Name           = "SilentAimGui"
+Gui.ResetOnSpawn   = false
+Gui.IgnoreGuiInset = true
+Gui.DisplayOrder   = 999
+Gui.Parent         = PlayerGui
+
+local Circle = Instance.new("Frame")
+Circle.BackgroundTransparency = 1
+Circle.BorderSizePixel        = 0
+Circle.ZIndex                 = 10
+Circle.Parent                 = Gui
+
+Instance.new("UICorner", Circle).CornerRadius = UDim.new(1, 0)
+
+local Stroke = Instance.new("UIStroke")
+Stroke.Thickness       = Config.FOVThickness
+Stroke.Color           = DefaultColor
+Stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+Stroke.Parent          = Circle
+
+local initM = UserInputService:GetMouseLocation()
+Circle.Size     = UDim2.fromOffset(Config.FOVRadius * 2, Config.FOVRadius * 2)
+Circle.Position = UDim2.fromOffset(initM.X - Config.FOVRadius, initM.Y - Config.FOVRadius)
+
+-- ============================================================
+-- TARGET FINDING
+-- ============================================================
+local AimParts = {
+    Head  = true,
+    Torso = true,
+    Arms  = false,
+    Legs  = false,
+}
+
+local function GetTargetPriority()
+    local list = {}
+    if AimParts.Head then table.insert(list, "Head") end
+    if AimParts.Torso then
+        table.insert(list, "UpperTorso")
+        table.insert(list, "Torso")
+        table.insert(list, "HumanoidRootPart")
+    end
+    if AimParts.Arms then
+        table.insert(list, "RightUpperArm")
+        table.insert(list, "LeftUpperArm")
+    end
+    if AimParts.Legs then
+        table.insert(list, "RightUpperLeg")
+        table.insert(list, "LeftUpperLeg")
+        table.insert(list, "RightLowerLeg")
+        table.insert(list, "LeftLowerLeg")
+        table.insert(list, "RightFoot")
+        table.insert(list, "LeftFoot")
+    end
+    if #list == 0 then table.insert(list, "HumanoidRootPart") end
+    return list
+end
+
+local function IsPartVisible(part, ownerChar)
+    if not part then return false end
+    local origin    = Camera.CFrame.Position
+    local direction = (part.Position - origin)
+    local distance  = direction.Magnitude
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    local excludeList = {}
+    if LocalPlayer.Character then
+        table.insert(excludeList, LocalPlayer.Character)
+    end
+    if ownerChar then
+        table.insert(excludeList, ownerChar)
+    end
+    rayParams.FilterDescendantsInstances = excludeList
+
+    local result = workspace:Raycast(origin, direction.Unit * distance, rayParams)
+    return result == nil
+end
+
+local function GetBestPart(player)
+    if player == LocalPlayer then return nil end
+    if IsSameTeam(player) then return nil end
+    local char = player.Character
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return nil end
+
+    local priority = GetTargetPriority()
+    for _, partName in ipairs(priority) do
+        local part = char:FindFirstChild(partName)
+        if part and IsPartVisible(part, char) then
+            return part
+        end
+    end
+    return nil
+end
+
+local function FindTarget()
+    local mouse = UserInputService:GetMouseLocation()
+
+    local bestVisible     = nil
+    local bestVisiblePart = nil
+    local bestVisibleDist = math.huge
+    local bestWall        = nil
+    local bestWallPart    = nil
+    local bestWallDist    = math.huge
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        if IsSameTeam(player) then continue end
+
+        local char = player.Character
+        if not char then continue end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then continue end
+
+        if (Camera.CFrame.Position - hrp.Position).Magnitude > Config.MaxDistance then continue end
+        local s, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+        if not onScreen or s.Z <= 0 then continue end
+        local screenDist = (Vector2.new(s.X, s.Y) - mouse).Magnitude
+        if screenDist > Config.FOVRadius then continue end
+
+        local visiblePart = GetBestPart(player)
+        if visiblePart then
+            if screenDist < bestVisibleDist then
+                bestVisibleDist = screenDist
+                bestVisible     = player
+                bestVisiblePart = visiblePart
+            end
+        else
+            if screenDist < bestWallDist then
+                bestWallDist = screenDist
+                bestWall     = player
+                bestWallPart = hrp
+            end
+        end
+    end
+
+    if bestVisible then return bestVisible, bestVisiblePart end
+    if bestWall    then return bestWall, bestWallPart end
+    return nil, nil
+end
+
+local function IsTargetDead(player)
+    if not player or not player.Parent then return true end
+    local char = player.Character
+    if not char then return true end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return true end
+    if hum.Health <= 0 then return true end
+    if hum:GetState() == Enum.HumanoidStateType.Dead then return true end
+    return false
+end
+
+-- ============================================================
+-- SNAP CAMERA
+-- ============================================================
+local function SnapToTarget()
+    if not LockedTarget or not LockedPart then return end
+    if IsTargetDead(LockedTarget) then
+        ClearLock()
+        return
+    end
+    local ok, pos = pcall(function() return LockedPart.Position end)
+    if not ok then return end
+    local camPos   = Camera.CFrame.Position
+    local upVector = Vector3.new(0, 1, 0)
+    local dir      = (pos - camPos).Unit
+    if math.abs(dir:Dot(upVector)) > 0.99 then
+        upVector = Camera.CFrame.RightVector
+    end
+    local newCF = CFrame.lookAt(camPos, pos, upVector)
+    Camera.CFrame   = newCF
+    LockedCamCFrame = newCF
+    LastGoodPos     = pos
+end
+
+-- ============================================================
+-- ESP
+-- ============================================================
+local function CreateESP(player)
+    if player == LocalPlayer or ESPObjects[player] then return end
+    local box = Drawing.new("Square")
+    box.Visible = false box.Color = BoxColor box.Thickness = 1.5 box.Filled = false
+    local hpText = Drawing.new("Text")
+    hpText.Visible = false hpText.Size = 13 hpText.Center = true hpText.Outline = true
+    hpText.Color = Color3.fromRGB(255,255,255)
+    local hpBg = Drawing.new("Square")
+    hpBg.Visible = false hpBg.Filled = true
+    hpBg.Color = Color3.fromRGB(30,30,30) hpBg.Transparency = 0.4
+    local hpFill = Drawing.new("Square")
+    hpFill.Visible = false hpFill.Filled = true hpFill.Transparency = 0.2
+    local nameTxt = Drawing.new("Text")
+    nameTxt.Visible = false nameTxt.Size = 12 nameTxt.Center = true
+    nameTxt.Outline = true nameTxt.Color = Color3.fromRGB(255,255,255)
+    ESPObjects[player] = {
+        box     = box,
+        hpText  = hpText,
+        hpBg    = hpBg,
+        hpFill  = hpFill,
+        nameTxt = nameTxt,
+    }
+end
+
+local function RemoveESP(player)
+    if not ESPObjects[player] then return end
+    local e = ESPObjects[player]
+    e.box:Remove()
+    e.hpText:Remove()
+    e.hpBg:Remove()
+    e.hpFill:Remove()
+    e.nameTxt:Remove()
+    ESPObjects[player] = nil
+end
+
+local function UpdateESP(player)
+    if player == LocalPlayer then return end
+    local e = ESPObjects[player]
+    if not e then return end
+    local function hide()
+        e.box.Visible     = false
+        e.hpText.Visible  = false
+        e.hpBg.Visible    = false
+        e.hpFill.Visible  = false
+        e.nameTxt.Visible = false
+    end
+    local char = player.Character
+    if not char then hide() return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp then hide() return end
+    local rv, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+    local dist = (hrp.Position - Camera.CFrame.Position).Magnitude
+    if not onScreen or dist > Config.MaxDistance or rv.Z <= 0 then hide() return end
+    local topV = Camera:WorldToViewportPoint(hrp.Position + Vector3.new(0, 3.2, 0))
+    local botV = Camera:WorldToViewportPoint(hrp.Position - Vector3.new(0, 3.2, 0))
+    local h = botV.Y - topV.Y
+    if h <= 0 then return end
+    local w    = h * 0.55
+    local left = rv.X - w / 2
+    local isTeam = IsSameTeam(player)
+    e.box.Color    = isTeam and Color3.fromRGB(100, 150, 255) or BoxColor
+    e.box.Position = Vector2.new(left, topV.Y)
+    e.box.Size     = Vector2.new(w, h)
+    e.box.Visible  = true
+    e.nameTxt.Position = Vector2.new(rv.X, topV.Y - 16)
+    e.nameTxt.Text     = player.Name
+    e.nameTxt.Color    = isTeam and Color3.fromRGB(100, 150, 255) or Color3.fromRGB(255, 80, 80)
+    e.nameTxt.Visible  = true
+    e.hpText.Position = Vector2.new(rv.X, topV.Y - 28)
+    e.hpText.Text     = math.floor(hum.Health) .. " / " .. math.floor(hum.MaxHealth)
+    e.hpText.Visible  = true
+    local hpPct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+    local barX  = left - 7
+    local fillH = h * hpPct
+    e.hpBg.Position = Vector2.new(barX, topV.Y)
+    e.hpBg.Size     = Vector2.new(3, h)
+    e.hpBg.Visible  = true
+    e.hpFill.Color    = Color3.new(
+        math.clamp(2 * (1 - hpPct), 0, 1),
+        math.clamp(2 * hpPct, 0, 1),
+        0
+    )
+    e.hpFill.Position = Vector2.new(barX, topV.Y + (h - fillH))
+    e.hpFill.Size     = Vector2.new(3, fillH)
+    e.hpFill.Visible  = true
+end
+
+local function SetupPlayer(player)
+    if player == LocalPlayer then return end
+    CreateESP(player)
+    local c = player.CharacterAdded:Connect(function()
+        task.wait(0.3)
+        RemoveESP(player)
+        CreateESP(player)
+    end)
+    table.insert(Connections, c)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do SetupPlayer(p) end
+
+local c3 = Players.PlayerAdded:Connect(SetupPlayer)
+local c4 = Players.PlayerRemoving:Connect(function(p) RemoveESP(p) end)
+table.insert(Connections, c3)
+table.insert(Connections, c4)
+
+-- ============================================================
+-- TERMINATE FUNCTION
+-- ============================================================
+local function TerminateScript()
+    Terminated     = true
+    Config.Enabled = false
+    ClearLock()
+
+    for _, conn in ipairs(Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+
+    pcall(function() RunService:UnbindFromRenderStep("SilentAimCamSave") end)
+    pcall(function() RunService:UnbindFromRenderStep("SilentAimCam") end)
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        RemoveESP(player)
+    end
+
+    pcall(function() Gui:Destroy() end)
+    print("[SilentAim] Terminated.")
+end
+
+-- ============================================================
+-- INSTANT DEATH DETECTION
+-- ============================================================
+local function HookTargetDeath(player)
+    if not player or not player.Character then return end
+    local hum = player.Character:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    hum:GetPropertyChangedSignal("Health"):Connect(function()
+        if LockedTarget ~= player then return end
+        if hum.Health <= 0 then
+            ClearLock()
+        end
+    end)
+
+    hum.Died:Connect(function()
+        if LockedTarget ~= player then return end
+        ClearLock()
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then
+        HookTargetDeath(p)
+        p.CharacterAdded:Connect(function()
+            task.wait(0.1)
+            HookTargetDeath(p)
+        end)
+    end
+end
+
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function()
+        task.wait(0.1)
+        HookTargetDeath(p)
+    end)
+end)
+
+-- ============================================================
+-- INPUT
+-- ============================================================
+local c5 = UserInputService.InputBegan:Connect(function(input, gp)
+    if Terminated then return end
+    if gp then return end
+
+    if input.KeyCode == Config.ToggleKey then
+        Config.Enabled = not Config.Enabled
+        Circle.Visible = Config.Enabled and Config.ShowFOV
+        if not Config.Enabled then ClearLock() end
+        print("[SilentAim]", Config.Enabled and "ON" or "OFF")
+        return
+    end
+
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if not Config.Enabled then return end
+
+        IsHolding = true
+
+        LockedTarget, LockedPart = FindTarget()
+        if not LockedTarget or not LockedPart then return end
+        if IsTargetDead(LockedTarget) then return end
+
+        local savedMouse = UserInputService:GetMouseLocation()
+
+        IsShooting     = true
+        SnapFrameCount = Config.SnapFrames
+
+        SnapToTarget()
+
+        task.defer(function()
+            mousemoveabs(savedMouse.X, savedMouse.Y)
+        end)
+    end
+end)
+table.insert(Connections, c5)
+
+local c6 = UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        ClearLock()
+    end
+end)
+table.insert(Connections, c6)
+
+-- ============================================================
+-- CAMERA SAVE LOOP (runs BEFORE snap loop)
+-- ============================================================
+RunService:BindToRenderStep(
+    "SilentAimCamSave",
+    Enum.RenderPriority.Camera.Value - 1,
+    function()
+        if Terminated or not Config.Enabled then return end
+        if not IsHolding or not LockedTarget then return end
+        local char     = LockedTarget.Character
+        local humAlive = char and char:FindFirstChildOfClass("Humanoid")
+        if not humAlive or humAlive.Health <= 0 then
+            ClearLock()
+        end
+    end
+)
+
+-- ============================================================
+-- CAMERA SNAP + ANTI RECOIL + ANTI SPREAD LOOP
+-- ============================================================
+RunService:BindToRenderStep(
+    "SilentAimCam",
+    Enum.RenderPriority.Camera.Value + 1,
+    function()
+        if Terminated or not Config.Enabled then return end
+
+        if IsHolding and AntiSpread then
+            ApplyAntiSpread()
+        end
+
+        if IsHolding and LockedTarget and LockedPart then
+            local char     = LockedTarget.Character
+            local hrpAlive = char and char:FindFirstChild("HumanoidRootPart")
+            local humAlive = char and char:FindFirstChildOfClass("Humanoid")
+
+            -- DEATH GUARD — clear everything, stop all snapping
+            local isDead = not hrpAlive or not humAlive
+                or humAlive.Health <= 0
+                or humAlive:GetState() == Enum.HumanoidStateType.Dead
+
+            if isDead then
+                ClearLock()
+                return
+            end
+
+            -- Re-check best visible part every frame
+            local betterPart = GetBestPart(LockedTarget)
+            if betterPart then
+                LockedPart = betterPart
+            elseif hrpAlive then
+                LockedPart = hrpAlive
+            end
+
+            local ok, pos = pcall(function() return LockedPart.Position end)
+            if not ok then return end
+
+            -- RAGDOLL GUARD — part fell below HRP
+            if LastGoodPos and pos.Y < hrpAlive.Position.Y - 3 then
+                ClearLock()
+                return
+            end
+
+            local camPos   = Camera.CFrame.Position
+            local upVector = Vector3.new(0, 1, 0)
+            local dir      = (pos - camPos).Unit
+            if math.abs(dir:Dot(upVector)) > 0.99 then
+                upVector = Camera.CFrame.RightVector
+            end
+
+            if AntiRecoil then
+                local newCF = CFrame.lookAt(camPos, pos, upVector)
+                Camera.CFrame   = newCF
+                LockedCamCFrame = newCF
+                LastGoodPos     = pos
+            end
+
+            return
+        end
+
+        -- Semi auto fallback
+        if not IsShooting then return end
+
+        if SnapFrameCount > 0 then
+            SnapFrameCount = SnapFrameCount - 1
+            SnapToTarget()
+        else
+            IsShooting = false
+        end
+    end
+)
+
+-- ============================================================
+-- MAIN RENDER LOOP
+-- ============================================================
+local c7 = RunService.RenderStepped:Connect(function()
+    if Terminated then return end
+
+    local mouse = UserInputService:GetMouseLocation()
+    local r     = Config.FOVRadius
+
+    Circle.Size      = UDim2.fromOffset(r * 2, r * 2)
+    Circle.Position  = UDim2.fromOffset(mouse.X - r, mouse.Y - r)
+    Circle.Visible   = Config.Enabled and Config.ShowFOV
+    Stroke.Thickness = Config.FOVThickness
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            if not ESPObjects[player] then CreateESP(player) end
+            UpdateESP(player)
+        end
+    end
+
+    if not Config.Enabled then
+        Stroke.Color = DefaultColor
+        return
+    end
+
+    local function FindTargetNoWall()
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player == LocalPlayer then continue end
+            if IsSameTeam(player) then continue end
+            local char = player.Character
+            if not char then continue end
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if not hum or hum.Health <= 0 then continue end
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if not hrp then continue end
+            if (Camera.CFrame.Position - hrp.Position).Magnitude > Config.MaxDistance then continue end
+            local s, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+            if not onScreen or s.Z <= 0 then continue end
+            local screenDist = (Vector2.new(s.X, s.Y) - mouse).Magnitude
+            if screenDist <= Config.FOVRadius then return player end
+        end
+        return nil
+    end
+
+    local p = FindTargetNoWall()
+    Stroke.Color = p and ReadyColor or DefaultColor
+end)
+table.insert(Connections, c7)
+
+-- ============================================================
+-- RESPAWN
+-- ============================================================
+local c8 = LocalPlayer.CharacterRemoving:Connect(function()
+    ClearLock()
+end)
+table.insert(Connections, c8)
+
+local c9 = LocalPlayer.CharacterAdded:Connect(function(newChar)
+    Character = newChar
+    ClearLock()
+end)
+table.insert(Connections, c9)
+
+-- ============================================================
+-- RAYFIELD UI
+-- ============================================================
+task.spawn(function()
+    local ok, Rayfield = pcall(function()
+        return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+    end)
+    if not ok or not Rayfield then
+        warn("[SilentAim] Rayfield failed — script still works")
+        return
+    end
+
+    local Window = Rayfield:CreateWindow({
+        Name            = "Silent Aim | CB / Town / Rivals / Arsenal",
+        LoadingTitle    = "Silent Aim",
+        LoadingSubtitle = "CB / Town / Rivals / Arsenal",
+        ConfigurationSaving = { Enabled = true, FileName = "CBSilentConfig" },
+        KeySystem = false,
+    })
+
+    -- MAIN TAB
+    local MainTab = Window:CreateTab("Main", "crosshair")
+
+    MainTab:CreateToggle({
+        Name = "Enabled", CurrentValue = Config.Enabled, Flag = "CB_Enabled",
+        Callback = function(val)
+            Config.Enabled = val
+            Circle.Visible = val and Config.ShowFOV
+            if not val then ClearLock() end
+        end,
+    })
+
+    MainTab:CreateToggle({
+        Name = "Team Check", CurrentValue = Config.TeamCheck, Flag = "CB_TeamCheck",
+        Callback = function(val) Config.TeamCheck = val end,
+    })
+
+    MainTab:CreateKeybind({
+        Name = "Toggle Key", CurrentKeybind = "T",
+        HoldToInteract = false, Flag = "CB_ToggleKey",
+        Callback = function(key)
+            local k = Enum.KeyCode[key]
+            if k then Config.ToggleKey = k end
+        end,
+    })
+
+    MainTab:CreateSlider({
+        Name = "Snap Frames", Range = {1, 6}, Increment = 1,
+        CurrentValue = Config.SnapFrames, Flag = "CB_SnapFrames",
+        Callback = function(val) Config.SnapFrames = val end,
+    })
+
+    MainTab:CreateToggle({
+        Name = "Aim at Head", CurrentValue = true, Flag = "CB_AimHead",
+        Callback = function(val) AimParts.Head = val end,
+    })
+
+    MainTab:CreateToggle({
+        Name = "Aim at Torso", CurrentValue = true, Flag = "CB_AimTorso",
+        Callback = function(val) AimParts.Torso = val end,
+    })
+
+    MainTab:CreateToggle({
+        Name = "Aim at Arms", CurrentValue = false, Flag = "CB_AimArms",
+        Callback = function(val) AimParts.Arms = val end,
+    })
+
+    MainTab:CreateToggle({
+        Name = "Aim at Legs", CurrentValue = false, Flag = "CB_AimLegs",
+        Callback = function(val) AimParts.Legs = val end,
+    })
+
+    MainTab:CreateParagraph({
+        Title   = "Full Auto Support",
+        Content = "Hold mouse to shoot. Camera re-locks to best visible part every frame. On kill camera stops completely — no snapping to other players.",
+    })
+
+    -- FOV TAB
+    local FOVTab = Window:CreateTab("FOV", "circle")
+
+    FOVTab:CreateToggle({
+        Name = "Show FOV Circle", CurrentValue = Config.ShowFOV, Flag = "CB_ShowFOV",
+        Callback = function(val)
+            Config.ShowFOV = val
+            Circle.Visible = Config.Enabled and val
+        end,
+    })
+
+    FOVTab:CreateSlider({
+        Name = "FOV Radius", Range = {20, 500}, Increment = 5,
+        Suffix = "px", CurrentValue = Config.FOVRadius, Flag = "CB_FOVRadius",
+        Callback = function(val) Config.FOVRadius = val end,
+    })
+
+    FOVTab:CreateSlider({
+        Name = "FOV Thickness", Range = {1, 5}, Increment = 1,
+        Suffix = "px", CurrentValue = Config.FOVThickness, Flag = "CB_FOVThickness",
+        Callback = function(val)
+            Config.FOVThickness = val
+            Stroke.Thickness    = val
+        end,
+    })
+
+    FOVTab:CreateSlider({
+        Name = "Max Distance", Range = {100, 5000}, Increment = 100,
+        Suffix = "studs", CurrentValue = Config.MaxDistance, Flag = "CB_MaxDistance",
+        Callback = function(val) Config.MaxDistance = val end,
+    })
+
+    -- ESP TAB
+    local ESPTab = Window:CreateTab("ESP", "eye")
+
+    ESPTab:CreateToggle({
+        Name = "Show ESP", CurrentValue = true, Flag = "CB_ESP",
+        Callback = function(val)
+            if not val then
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if ESPObjects[p] then
+                        local e = ESPObjects[p]
+                        e.box.Visible     = false
+                        e.hpText.Visible  = false
+                        e.hpBg.Visible    = false
+                        e.hpFill.Visible  = false
+                        e.nameTxt.Visible = false
+                    end
+                end
+            end
+        end,
+    })
+
+    -- EFFECTS TAB
+    local EffectsTab = Window:CreateTab("Effects", "shield")
+
+    EffectsTab:CreateToggle({
+        Name = "Anti Effects Master", CurrentValue = true, Flag = "CB_AntiEffects",
+        Callback = function(val) AntiEffectsEnabled = val end,
+    })
+
+    EffectsTab:CreateToggle({
+        Name = "Anti Smoke", CurrentValue = true, Flag = "CB_AntiSmoke",
+        Callback = function(val)
+            AntiSmoke = val
+            if val then ScanWorkspace() end
+        end,
+    })
+
+    EffectsTab:CreateToggle({
+        Name = "Anti Flashbang", CurrentValue = true, Flag = "CB_AntiFlash",
+        Callback = function(val)
+            AntiFlash = val
+            if val then ScanGui() end
+        end,
+    })
+
+    EffectsTab:CreateToggle({
+        Name = "Anti Fire", CurrentValue = true, Flag = "CB_AntiFire",
+        Callback = function(val)
+            AntiFire = val
+            if val then ScanWorkspace() end
+        end,
+    })
+
+    EffectsTab:CreateToggle({
+        Name = "Anti Recoil", CurrentValue = true, Flag = "CB_AntiRecoil",
+        Callback = function(val) AntiRecoil = val end,
+    })
+
+    EffectsTab:CreateToggle({
+        Name = "Anti Spread", CurrentValue = true, Flag = "CB_AntiSpread",
+        Callback = function(val) AntiSpread = val end,
+    })
+
+    EffectsTab:CreateParagraph({
+        Title   = "Effects Info",
+        Content = "Anti Recoil = re-locks camera every frame. Anti Spread = zeroes horizontal velocity. Both ON = full auto works perfectly.",
+    })
+
+    -- SCRIPT TAB
+    local ScriptTab = Window:CreateTab("Script", "power")
+
+    ScriptTab:CreateButton({
+        Name = "End Script",
+        Callback = function()
+            TerminateScript()
+            pcall(function() Rayfield:Destroy() end)
+        end,
+    })
+
+    -- INFO TAB
+    local InfoTab = Window:CreateTab("Info", "info")
+
+    InfoTab:CreateParagraph({
+        Title = "How it works",
+        Content = "Semi auto: click to snap for Snap Frames then release. Full auto: hold mouse, camera re-locks every frame. On kill: stops completely, no snapping to other players.",
+    })
+
+    InfoTab:CreateParagraph({
+        Title = "Circle Colors",
+        Content = "White = no enemy in FOV | Orange = enemy in FOV (visible or behind wall)",
+    })
+
+    InfoTab:CreateParagraph({
+        Title = "Game Support",
+        Content = "Counter Blox, Town, Rivals, Arsenal — all supported.",
+    })
+end)
+
+print("[SilentAim] Loaded — CB / Town / Rivals / Arsenal | Full Auto | Smart Part Target | Wall Snap | Anti Recoil | Anti Spread | RAC safe")
